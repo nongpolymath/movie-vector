@@ -1,55 +1,73 @@
 ## MovieVector: Text, Time, and Meaning in Movie Search
-A small learning project: an Elasticsearch index of movies with a FastAPI backend. The idea is that how you index the data decides what you can ask of it, so the same movies are searchable three ways: by text (keyword search over title and overview), by time (a timeline grouped into eras), and by meaning (semantic "vibe" search over `all-MiniLM-L6-v2` embeddings). There are also per-genre stats, prefix autocomplete, and consistent error handling. It's meant for learning how indexing shapes queries, not for production.
+A learning project with a production-inspired backend, scaled to one laptop. Movies sit in an Elasticsearch index behind a FastAPI service, searchable three ways by how they're indexed: text (keyword over title and overview), time (a timeline grouped into eras), and meaning (semantic "vibe" search over `all-MiniLM-L6-v2` embeddings). Plus per-genre stats, prefix autocomplete, and consistent errors.
 
-### Requirements
-Docker (for Elasticsearch) and Python 3.10+. Elasticsearch 8.15 runs single-node with security disabled: fine for local learning, not for anything networked.
+The point is learning how indexing shapes queries while practising real architecture: Airflow schedules the sync, Kafka decouples the stages, a separate container serves the model, Elasticsearch queries behind an alias. All open source, so the production-inspired design costs nothing and locks in nothing. Not a production deployment (single node, security off); just production-shaped, shrunk to a laptop.
+
+### Stack
+- Elasticsearch 8.15: index and query engine. Single-node, security off: fine locally, not networked.
+- FastAPI + uvicorn: the search API.
+- Embedder: a small FastAPI container wrapping `all-MiniLM-L6-v2`, its own image so `torch` stays out of the API.
+- Airflow: schedules the TMDB sync.
+- Kafka: carries changed movie ids from poll to ingest worker.
+- Docker Compose: runs the stack on one machine.
+
+Requirements: Docker and Python 3.10+.
+
+### Built vs planned
+Built: the mapping, CSV bulk-load, and core API (`/health`, `/movies/{id}`, `/search`, `/stats/genres`, `/suggest`). Planned (Milestone 4): TMDB ingestion, the embedder, the Airflow + Kafka sync, and the timeline and vibe modes. Architecture below is the target; the setup steps run what exists today.
 
 ### Setup
-Start Elasticsearch, then the environment (Windows PowerShell):
+Start the stack, then the Python env (Windows PowerShell):
 
     docker compose up -d
     python -m venv .venv
     .venv\Scripts\Activate.ps1
     pip install -r requirements.txt
 
-ES listens on http://localhost:9200 (confirm with `curl.exe http://localhost:9200`).
+ES listens on http://localhost:9200 (`curl.exe http://localhost:9200`).
 
 ### Loading data
-`data/movies.csv` is one movie per row (title, overview, genres, director, year, rating; genres pipe-separated). From the project root:
+Today the index loads from `data/movies.csv` (one movie per row: title, overview, genres, director, year, rating; genres pipe-separated):
 
     python -m app.create_index   # (re)create the movies index + mapping
     python -m app.load_movies    # bulk-load every row
 
-A field's type can't change on an existing index, so any mapping change means rerunning both.
+A field's type can't change in place, so a mapping change means rerunning both. The target pipeline swaps this CSV load for the TMDB sync (below), same index and alias.
 
 ### Running the API
-    uvicorn app.api:app --reload   # interactive docs at http://localhost:8000/docs
+    uvicorn app.api:app --reload   # docs at http://localhost:8000/docs
 
 ### Endpoints
-- `GET /health`: status object for liveness checks.
+- `GET /health`: liveness status.
 - `GET /movies/{movie_id}`: one movie by id, or 404.
-- `GET /search`: full-text over title and overview. Params: q, genre, year_from, year_to, min_rating, page, size. Returns total and the current page, each result scored.
-- `GET /stats/genres`: movies grouped by genre with count and average rating. Params: top, min_rating.
-- `GET /suggest`: autocomplete; a partial q returns a few title/year matches. Needs title mapped search-as-you-type.
+- `GET /search`: full-text over title and overview. Params: q, genre, year_from, year_to, min_rating, page, size. Returns total and the scored page.
+- `GET /stats/genres`: movies per genre with count and average rating. Params: top, min_rating.
+- `GET /suggest`: autocomplete; a partial q returns a few title/year matches.
+- `GET /search/timeline` (planned): trope query plus era-bucket aggregation.
+- `GET /search/vibe` (planned): semantic kNN over overview embeddings.
 
 ### Project layout
-- `app/client.py`: shared Elasticsearch client every module imports.
-- `app/create_index.py`: defines the mapping and creates the index.
+- `app/client.py`: shared Elasticsearch client.
+- `app/create_index.py`: mapping + index creation.
 - `app/load_movies.py`: bulk-loads the CSV.
-- `app/api.py`: FastAPI app and all endpoints.
-- `app/search.py`: scratch example queries against the client.
-- `app/index_one_mov.py`: indexes one hardcoded movie (an early index/get step).
-- `embedder/`: standalone serving container, a small FastAPI app loading `all-MiniLM-L6-v2` behind `POST /embed`. Its own image so `torch` stays out of the search API; ingest and the API both call it over HTTP.
+- `app/api.py`: FastAPI app and endpoints.
+- `app/search.py`: scratch example queries.
+- `app/index_one_mov.py`: indexes one hardcoded movie (early index/get step).
+- `embedder/` (planned): serving container for `all-MiniLM-L6-v2` behind `POST /embed`; sync worker and API call it over HTTP.
+- `app/tmdb_sync/` (planned): Airflow DAG plus Kafka producer (poll) and consumer (ingest worker).
 
-### Architecture (target, next milestone)
-TMDB feeds an ingestion script that pages and maps movies, then bulk-upserts into Elasticsearch behind a `movies` alias (so reindexes are a swap, not a rebuild). Embedding runs in its own CPU container, a small FastAPI app wrapping `sentence-transformers` (`all-MiniLM-L6-v2`), which keeps `torch` out of the search-API image. Ingest and the search API both reach it on `POST /embed`: ingest to embed overviews, the API to embed the incoming vibe query.
+### Architecture (target)
+Airflow schedules the sync. Each run polls TMDB `/movie/changes` and produces the changed ids to Kafka; a worker consumes them, fetches each movie (`GET /movie/{id}`), embeds the overview, and bulk-upserts into Elasticsearch behind a `movies` alias (reindex is a swap, not a rebuild). Failures go to a dead-letter topic; Airflow also runs the periodic rebuild-and-swap. The embedder is its own CPU container wrapping `all-MiniLM-L6-v2`, keeping `torch` out of the API; the API embeds vibe queries via the same `POST /embed`.
 
-    TMDB  /discover/movie
-          │
-          ▼
+    Airflow (scheduler, own container)
+      │  cadence:  poll changes  +  periodic reconcile (rebuild + alias swap)
+      ▼
+    Kafka topic: changes  ◀──changed ids──  GET TMDB /movie/changes
+      │  consume
+      ▼
     ┌─────────────────────────────┐        ┌──────────────────────────────┐
-    │  app/tmdb_ingest.py          │        │  embedder  (own container)   │
-    │  page · map · bulk-upsert    │─text──▶│  FastAPI · all-MiniLM-L6-v2  │
+    │  sync worker (consumer)      │        │  embedder  (own container)   │
+    │  fetch · map · upsert        │─text──▶│  FastAPI · all-MiniLM-L6-v2  │
     │  (_id = TMDB id)             │◀──vec──│  POST /embed {text}→384-d    │
     └─────────────────────────────┘        └──────────────────────────────┘
           │                                       ▲        │
@@ -67,24 +85,34 @@ TMDB feeds an ingestion script that pages and maps movies, then bulk-upserts int
                                                    ▲
                                              HTTP  │  browser / curl
 
-Search modes: keyword (`/search`) is a bool query over title+overview; timeline (`/search/timeline`) is aggregation into era buckets with top_hits per era; vibe (`/search/vibe`, the ML feature) embeds the query via the embedder, then kNN over overview_vector. Everything runs in Docker on a laptop, CPU only.
+Modes: keyword is a bool query over title+overview; timeline aggregates into era buckets with top_hits per era; vibe embeds the query, then kNN over overview_vector. All Docker, laptop, CPU only.
+
+### Keeping in sync with TMDB
+TMDB keeps changing, so ingest reruns to stay current. Airflow runs the schedule (retriable, observable, re-triggerable) instead of a bare cron job. Each run polls `/movie/changes`, produces the ids to Kafka, and a worker consumes, fetches, embeds, and upserts by TMDB id. Kafka decouples the steps: failures go to a dead-letter topic instead of stalling the run, and workers scale out.
+
+What a run does, simplest to smartest:
+- Reload everything. Simplest; can't drop deleted movies.
+- Rebuild and swap. Fresh index, then flip the alias; clears deletions.
+- Fetch only changes. The default; updates just the day's changes, cheapest.
+
+Fetch-only-changes is the steady state; a periodic rebuild-and-swap clears drift and deletes.
 
 ### Design alternative: TEI
-The embedder is swappable: anything answering `POST /embed` works, so ingest and search code never change. The chosen build is a small in-repo FastAPI app (full control, uniform stack, most to learn from). The alternative is HuggingFace Text Embeddings Inference (TEI), a prebuilt server you run instead of writing one:
+The embedder is swappable: anything answering `POST /embed` works, so ingest and search code never change. The build here is a small in-repo FastAPI app (full control, uniform stack, most to learn from). The alternative is HuggingFace Text Embeddings Inference (TEI), a prebuilt server:
 
     embedder:
       image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
       command: --model-id sentence-transformers/all-MiniLM-L6-v2
 
-TEI pros: fast on CPU (Rust, dynamic batching), built-in health/metrics/warmup, zero serving code, MiniLM/BERT first-class. TEI cons: an opaque binary you adapt to rather than own, less serving insight, one more image to pin, and a throughput edge that's irrelevant at this scale. Start with the FastAPI embedder; because the contract is identical, moving to TEI later is a compose change, not a code change.
+TEI: fast on CPU, built-in health/metrics, zero serving code, but an opaque binary and one more image to pin, with a throughput edge that's irrelevant at this scale. Start with the FastAPI embedder; the identical contract makes a later switch a compose change, not a code change.
 
 ### Roadmap: Milestone 4
-Expand from the CSV to TMDB and add two search modes: an aggregation timeline and a semantic vibe search. Stand up the embedder first (both features call it), then ingestion (both need real data). Each part runs on its own.
+Expand from CSV to TMDB and add two search modes (timeline, vibe). Stand up the embedder first (both features call it), then ingestion. Each part runs on its own.
 
-Part 1, TMDB ingestion + alias. Page `/discover/movie` by popularity (cap ~2-5k), use the TMDB id as `_id` so reloads are idempotent upserts, map release_date as a real date (keep year), read/write through a `movies` alias on `movies_v1`, and yield each page into `helpers.bulk`.
+Part 1, TMDB sync (Airflow + Kafka). A DAG polls `/movie/changes` on a cadence and produces changed ids to Kafka; a consumer fetches each movie, uses the TMDB id as `_id` for idempotent upserts, maps release_date as a date (keep year), and reads/writes through a `movies` alias on `movies_v1`. A periodic DAG does the rebuild-and-swap.
 
-Part 2, timeline search. `GET /search/timeline?q=`: bool query for the trope plus a range aggregation into fixed era buckets (1950s, 60s, ...), with top_hits (size 1, by rating) per bucket. Hand-curated eras can come later.
+Part 2, timeline search. `GET /search/timeline?q=`: bool query for the trope plus a range aggregation into fixed era buckets, top_hits (size 1, by rating) per bucket.
 
-Part 3, vibe search (the ML feature). Add `overview_vector` dense_vector(384, cosine) and reindex, have the loader batch-call the embedder to vectorize overviews, and expose `GET /search/vibe?q=` as kNN (k=10, num_candidates=100) reusing MovieResult. The API embeds the query via the same service.
+Part 3, vibe search. Add `overview_vector` dense_vector(384, cosine) and reindex, have the worker batch-call the embedder to vectorize overviews, and expose `GET /search/vibe?q=` as kNN (k=10, num_candidates=100). The API embeds the query via the same service.
 
-Out of scope: no CLIP, raw BERT, or fine-tuning; one CPU FastAPI embedder (TEI is the documented alternative, not both); no GPU, autoscaling, or queue; overviews only, no review embeddings; pure kNN first, no hybrid/RRF.
+Out of scope: no CLIP, raw BERT, or fine-tuning; one CPU embedder (TEI is the alternative, not both); no GPU or autoscaling; overviews only; pure kNN first, no hybrid/RRF.

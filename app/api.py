@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 INDEX = "movies"
 
-app = FastAPI(title="Movie Search API", version="0.1.0")
+app = FastAPI(title="MovieVector API", version="0.1.0")
 
 
 @app.get("/", include_in_schema=False)

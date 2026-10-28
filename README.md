@@ -1,7 +1,7 @@
 ## MovieVector: Text, Time, and Meaning in Movie Search
-A learning project with a production-inspired backend, scaled to one laptop. Movies sit in an Elasticsearch index behind a FastAPI service, searchable three ways by how they're indexed: text (keyword over title and overview), time (a timeline grouped into eras), and meaning (semantic "vibe" search over `all-MiniLM-L6-v2` embeddings). Plus per-genre stats, prefix autocomplete, and consistent errors.
+A learning project with a production-inspired backend, scaled down for development purposes but can be easily scalable when needed. Movies sit in an Elasticsearch index behind a FastAPI service, searchable three ways by how they're indexed: text (keyword over title and overview), time (a timeline grouped into eras), and meaning (semantic "vibe" search over `all-MiniLM-L6-v2` embeddings). Plus per-genre stats, prefix autocomplete, and consistent errors.
 
-The point is learning how indexing shapes queries while practising real architecture: Airflow schedules the sync, Kafka decouples the stages, a separate container serves the model, Elasticsearch queries behind an alias. All open source, so the production-inspired design costs nothing and locks in nothing. Not a production deployment (single node, security off); just production-shaped, shrunk to a laptop.
+The system is built from small, decoupled services: Airflow schedules a periodic sync from TMDB, Kafka carries changed movie ids between the poll and ingest stages, a dedicated container serves the ML embedding model, and Elasticsearch stores and queries the data behind an alias so indexes can be swapped without downtime. A FastAPI service exposes the search endpoints on top. The aim is to show how the way data is indexed shapes the queries it can answer, using an architecture that mirrors a real deployment while running on open-source components.
 
 ### Stack
 - Elasticsearch 8.15: index and query engine. Single-node, security off: fine locally, not networked.
@@ -14,7 +14,7 @@ The point is learning how indexing shapes queries while practising real architec
 Requirements: Docker and Python 3.10+.
 
 ### Built vs planned
-Built: the mapping, CSV bulk-load, and core API (`/health`, `/movies/{id}`, `/search`, `/stats/genres`, `/suggest`). Planned (Milestone 4): TMDB ingestion, the embedder, the Airflow + Kafka sync, and the timeline and vibe modes. Architecture below is the target; the setup steps run what exists today.
+Built: the mapping, CSV bulk-load, and core API (`/health`, `/movies/{id}`, `/search`, `/stats/genres`, `/suggest`). Planned: TMDB ingestion, the embedder, the Airflow + Kafka sync, and the timeline and vibe modes. Architecture below is the target; the setup steps run what exists today.
 
 ### Setup
 Start the stack, then the Python env (Windows PowerShell):
@@ -85,7 +85,7 @@ Airflow schedules the sync. Each run polls TMDB `/movie/changes` and produces th
                                                    ▲
                                              HTTP  │  browser / curl
 
-Modes: keyword is a bool query over title+overview; timeline aggregates into era buckets with top_hits per era; vibe embeds the query, then kNN over overview_vector. All Docker, laptop, CPU only.
+Modes: keyword is a bool query over title+overview; timeline aggregates into era buckets with top_hits per era; vibe embeds the query, then kNN over overview_vector. All Docker, CPU only.
 
 ### Keeping in sync with TMDB
 TMDB keeps changing, so ingest reruns to stay current. Airflow runs the schedule (retriable, observable, re-triggerable) instead of a bare cron job. Each run polls `/movie/changes`, produces the ids to Kafka, and a worker consumes, fetches, embeds, and upserts by TMDB id. Kafka decouples the steps: failures go to a dead-letter topic instead of stalling the run, and workers scale out.
